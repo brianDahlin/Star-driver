@@ -1,17 +1,17 @@
-import { Scenes, Markup } from 'telegraf';
-import { Injectable } from '@nestjs/common';
-import { InjectBot } from 'nestjs-telegraf';
-import { Telegraf } from 'telegraf';
+import { Injectable, Logger } from '@nestjs/common';
+import { Scene, SceneEnter, Ctx } from 'nestjs-telegraf';
+import { Context, Markup } from 'telegraf';
 
+@Scene('start')
 @Injectable()
-@Scenes.Stage()
 export class StartScene {
-  constructor(@InjectBot() private bot: Telegraf) {}
+  private readonly logger = new Logger(StartScene.name);
 
-  @Scenes.Start()
-  async onStart(ctx: Scenes.SceneContext) {
+  @SceneEnter()
+  async onSceneEnter(@Ctx() ctx: Context): Promise<void> {
+    this.logger.log('Пользователь начал диалог: /start');
     await ctx.replyWithPhoto(
-      { url: 'https://…starship-banner.png' },
+      { url: 'https://example.com/starship-banner.png' },
       {
         caption:
           '✨ Добро пожаловать! Здесь вы можете купить Звёзды дешевле, чем в Telegram.\nБез KYC — просто, быстро и удобно.',
@@ -21,6 +21,5 @@ export class StartScene {
         ]),
       },
     );
-    ctx.scene.leave();
   }
 }
