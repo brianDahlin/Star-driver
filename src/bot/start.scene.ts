@@ -11,7 +11,9 @@ export class StartScene {
   async onSceneEnter(@Ctx() ctx: Context): Promise<void> {
     this.logger.log('Пользователь начал диалог: /start');
     await ctx.replyWithPhoto(
-      { url: 'https://example.com/starship-banner.png' },
+      {
+        url: 'https://briandahlin.github.io/Star-driver/src/common/star-driver.png',
+      },
       {
         caption:
           '✨ Добро пожаловать! Здесь вы можете купить Звёзды дешевле, чем в Telegram.\nБез KYC — просто, быстро и удобно.',

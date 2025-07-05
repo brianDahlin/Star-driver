@@ -4,8 +4,20 @@ services:
     restart: always
     env_file:
       - .env
+    depends_on:
+      - postgres
+
+  bot-dev:
+    build:
+      context: .
+      target: builder
+    command: npm run start:dev
+    env_file:
+      - .env
     volumes:
-      - ./:/app
+      - ./:/app # чтобы видеть правки на лету
+    ports:
+      - '3000:3000'
     depends_on:
       - postgres
 
