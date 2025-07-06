@@ -1,4 +1,3 @@
-// src/bot/bot.service.ts
 import { Injectable, Logger } from '@nestjs/common';
 import { Telegram } from 'telegraf';
 import { ConfigService } from '@nestjs/config';

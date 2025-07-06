@@ -1,4 +1,3 @@
-// src/main.ts
 import 'dotenv/config';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
@@ -7,6 +6,7 @@ import { ConfigService } from '@nestjs/config';
 import { BotService } from './bot/bot.service';
 import { Telegraf, Context } from 'telegraf';
 import { CallbackData } from './common/constants/payment.constants';
+import { Markup } from 'telegraf';
 
 async function bootstrap(): Promise<void> {
   // инициализация DI-контекста без HTTP-сервера
@@ -15,6 +15,12 @@ async function bootstrap(): Promise<void> {
   });
   AppLogger.log('🟢 Application context initialized');
 
+  const mainKeyboard = Markup.keyboard([
+    ['⭐ Купить Звёзды'],
+    ['🎁 Сделать Подарок Другу'],
+  ])
+    .resize()
+    .oneTime(false);
   const config = appCtx.get(ConfigService);
   const botService = appCtx.get(BotService);
 
@@ -22,7 +28,10 @@ async function bootstrap(): Promise<void> {
   const bot = new Telegraf<Context>(token);
 
   // Обработка команды /start
-  bot.start((ctx) => botService.handleStart(ctx.chat.id));
+  bot.start(async (ctx) => {
+    await ctx.reply('Выберите действие:', mainKeyboard);
+    return botService.handleStart(ctx.chat.id);
+  });
 
   // Обработка inline-кнопок через фильтры
   bot.action(CallbackData.BUY, (ctx) => {
@@ -43,11 +52,34 @@ async function bootstrap(): Promise<void> {
     );
   });
 
+  bot.command('buy_stars', (ctx) => {
+    // эмулируем callback без queryId
+    return botService.handleCallback('', CallbackData.BUY, ctx.chat.id);
+  });
+
+  // Slash-команда /gift
+  bot.command('gift', (ctx) => {
+    return botService.handleCallback('', CallbackData.GIFT, ctx.chat.id);
+  });
+
   // Обработка всех остальных текстовых сообщений
   // Обработка всех текстовых сообщений
   bot.on('text', (ctx) => {
-    // ctx.message.text гарантированно строка для 'text' события
-    return botService.handleMessage(ctx.chat.id, ctx.message.text);
+    const text = ctx.message.text;
+
+    // если нажали «⭐ Купить Звёзды» на Reply-клавиатуре
+    if (text === '⭐ Купить Звёзды') {
+      // пустой queryId, он не нужен для Reply-кнопок
+      return botService.handleCallback('', CallbackData.BUY, ctx.chat.id);
+    }
+
+    // если нажали «🎁 Купить Другу»
+    if (text === '🎁 Сделать Подарок Другу') {
+      return botService.handleCallback('', CallbackData.GIFT, ctx.chat.id);
+    }
+
+    // всё остальное в общий текст-флоу
+    return botService.handleMessage(ctx.chat.id, text);
   });
 
   // Сбрасываем вебхук, запускаем polling
