@@ -8,13 +8,11 @@ export enum CallbackData {
 
 /** Методы оплаты */
 export enum PaymentMethod {
-  TON = 'TON',
-  USDT = 'Крипта / USDT',
+  CRYPTO = '💰 Криптовалюты',
   SBP = 'СБП / Карты РФ',
 }
 
 /** Клавиатура с методами оплаты */
 export const PAYMENT_KEYBOARD = [
-  [PaymentMethod.TON, PaymentMethod.USDT],
-  [PaymentMethod.SBP],
+  [PaymentMethod.CRYPTO, PaymentMethod.SBP],
 ] as const;

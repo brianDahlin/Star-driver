@@ -1,12 +1,17 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Telegram } from 'telegraf';
 import { ConfigService } from '@nestjs/config';
-import { MIN_STARS, START_CAPTION } from '../common/constants/star.constants';
+import { randomUUID } from 'crypto';
+import { MIN_STARS, START_CAPTION, STAR_PRICE_USD, Currency } from '../common/constants/star.constants';
 import {
   CallbackData,
   PaymentMethod,
-  PAYMENT_KEYBOARD,
 } from '../common/constants/payment.constants';
+import { WataService } from '../payments/wata.service';
+import { PayID19Service } from '../payments/payid19.service';
+import { FragmentService } from '../payments/fragment.service';
+import { TransactionLoggerService } from '../common/services/transaction-logger.service';
+import { Markup } from 'telegraf';
 
 // Сессия пользователя для диалогов
 interface SessionData {
@@ -16,13 +21,36 @@ interface SessionData {
   count?: number;
 }
 
+// Информация о заказе для webhook'ов
+export interface OrderInfo {
+  chatId: number;
+  userId: number;
+  count: number;
+  isGift: boolean;
+  giftUsername?: string;
+  description: string;
+  timestamp: string;
+}
+
 @Injectable()
 export class BotService {
   private readonly tg: Telegram;
   private readonly logger = new Logger(BotService.name);
   private readonly session = new Map<number, SessionData>();
+  
+  // Постоянное Reply-меню
+  private readonly mainKeyboard = Markup.keyboard([
+    ['⭐ Купить Звёзды'],
+    ['🎁 Сделать Подарок Другу'],
+  ]).resize().oneTime(false);
 
-  constructor(private readonly config: ConfigService) {
+  constructor(
+    private readonly config: ConfigService,
+    private readonly wataService: WataService,
+    private readonly payid19Service: PayID19Service,
+    private readonly fragmentService: FragmentService,
+    private readonly transactionLogger: TransactionLoggerService,
+  ) {
     const token = this.config.getOrThrow<string>('TELEGRAM_TOKEN');
     this.tg = new Telegram(token);
     this.logger.log('Telegram client initialized');
@@ -47,10 +75,18 @@ export class BotService {
           ],
         },
       });
+      
+      // Отправляем также постоянное Reply-меню
+      await this.tg.sendMessage(chatId, 'Выберите действие:', {
+        reply_markup: this.mainKeyboard.reply_markup
+      });
+      
       this.logger.log(`/start handled for chat ${chatId}`);
     } catch (err) {
       this.logger.error(`handleStart failed for chat ${chatId}`, err as Error);
-      await this.tg.sendMessage(chatId, START_CAPTION);
+      await this.tg.sendMessage(chatId, START_CAPTION, {
+        reply_markup: this.mainKeyboard.reply_markup
+      });
     }
   }
 
@@ -77,6 +113,7 @@ export class BotService {
         await this.tg.sendMessage(
           userId,
           'Неизвестная команда. Нажмите /start.',
+          { reply_markup: this.mainKeyboard.reply_markup }
         );
         return;
     }
@@ -86,7 +123,9 @@ export class BotService {
   async handleMessage(chatId: number, text: string): Promise<void> {
     const session = this.session.get(chatId);
     if (!session) {
-      await this.tg.sendMessage(chatId, 'Нажмите /start, чтобы начать.');
+      await this.tg.sendMessage(chatId, 'Нажмите /start, чтобы начать.', {
+        reply_markup: this.mainKeyboard.reply_markup
+      });
       return;
     }
     if (session.flow === 'buy') {
@@ -101,12 +140,15 @@ export class BotService {
     await this.tg.sendMessage(
       chatId,
       `🌟 Введите нужное количество звёзд (минимум ${MIN_STARS}):`,
+      { reply_markup: this.mainKeyboard.reply_markup }
     );
   }
 
   /** Шаг 1 (подарок): запрашиваем username получателя */
   private async askUsername(chatId: number): Promise<void> {
-    await this.tg.sendMessage(chatId, 'Введите @username получателя:');
+    await this.tg.sendMessage(chatId, 'Введите @username получателя:', {
+      reply_markup: this.mainKeyboard.reply_markup
+    });
   }
 
   /** Обрабатываем поток покупки */
@@ -121,12 +163,25 @@ export class BotService {
         await this.tg.sendMessage(
           chatId,
           `❌ Введите корректное число (минимум ${MIN_STARS}).`,
+          { reply_markup: this.mainKeyboard.reply_markup }
         );
         return;
       }
+
+      // Проверяем баланс Fragment перед предложением оплаты
+      const balanceCheckResult = await this.checkFragmentBalance(count);
+      if (!balanceCheckResult.sufficient) {
+        await this.tg.sendMessage(
+          chatId,
+          
+          `🔄 Попробуйте указать меньшее количество звёзд или обратитесь в техническую поддержку.`
+        );
+        return;
+      }
+
       session.count = count;
       session.step = 2;
-      await this.sendPaymentOptions(chatId);
+      await this.sendPaymentOptionsWithDetails(chatId, count, false);
       return;
     }
     // шаг 2: выбор оплаты
@@ -152,12 +207,25 @@ export class BotService {
         await this.tg.sendMessage(
           chatId,
           `❌ Введите корректное число (минимум ${MIN_STARS}).`,
+          { reply_markup: this.mainKeyboard.reply_markup }
         );
         return;
       }
+
+      // Проверяем баланс Fragment перед предложением оплаты
+      const balanceCheckResult = await this.checkFragmentBalance(count);
+      if (!balanceCheckResult.sufficient) {
+        await this.tg.sendMessage(
+          chatId,
+         
+          `🔄 Попробуйте указать меньшее количество звёзд или обратитесь в техническую поддержку.`
+        );
+        return;
+      }
+
       session.count = count;
       session.step = 3;
-      await this.sendPaymentOptions(chatId);
+      await this.sendPaymentOptionsWithDetails(chatId, count, true, session.username);
       return;
     }
     // шаг 3: выбор оплаты
@@ -165,15 +233,178 @@ export class BotService {
     await this.processPayment(chatId, method, session, true);
   }
 
-  /** Отправляем клавиатуру с методами оплаты */
-  private async sendPaymentOptions(chatId: number): Promise<void> {
-    await this.tg.sendMessage(chatId, '💳 Выберите способ оплаты:', {
-      reply_markup: {
-        keyboard: PAYMENT_KEYBOARD.map((row) => row.map((text) => ({ text }))),
-        resize_keyboard: true,
-        one_time_keyboard: true,
-      },
-    });
+
+
+  /** Отправляем детали заказа с inline-кнопками для оплаты */
+  private async sendPaymentOptionsWithDetails(
+    chatId: number, 
+    count: number, 
+    isGift: boolean, 
+    giftUsername?: string
+  ): Promise<void> {
+    try {
+      // Генерируем уникальный orderId
+      const timestamp = Date.now();
+      const randomId = randomUUID().replace(/-/g, '').substring(0, 8);
+      const microseconds = process.hrtime.bigint() % 1000000n;
+      const orderId = `${timestamp}_${chatId}_${randomId}_${microseconds}`;
+      
+      const description = isGift 
+        ? `Подарок ${count} звезд для @${giftUsername}` 
+        : `Покупка ${count} звезд`;
+      
+      // Сохраняем информацию о заказе
+      this.saveOrderInfo(orderId, {
+        chatId,
+        userId: chatId,
+        count,
+        isGift,
+        giftUsername,
+        description,
+        timestamp: new Date().toISOString(),
+      });
+
+      // Рассчитываем стоимости
+      const cryptoAmount = count * STAR_PRICE_USD; // USD для крипто
+      const cardAmount = count * 2; // RUB для карт/СБП вата сервис не позволяет меньше ста рублей
+
+      // Определяем username получателя для PayID19
+      let recipientUsername: string;
+      if (isGift && giftUsername) {
+        recipientUsername = giftUsername;
+      } else {
+        const userInfo = await this.getUserInfo(chatId);
+        recipientUsername = userInfo?.username || `user_${chatId}`;
+      }
+
+      // Создаем ссылки на оплату
+      const enhancedDescription = `${description} | recipient:${recipientUsername}`;
+      
+      try {
+        const [cryptoInvoiceUrl, cardPaymentLink] = await Promise.all([
+          this.payid19Service.createInvoice(
+            cryptoAmount,
+            'USD',
+            enhancedDescription,
+            orderId,
+            undefined
+          ),
+          this.wataService.createPaymentLink(
+            cardAmount,
+            Currency.RUB,
+            description,
+            orderId
+          )
+        ]);
+
+        // Логируем успешное создание платежей
+        await this.transactionLogger.logPaymentCreated({
+          transactionId: orderId + '_crypto',
+          orderId,
+          amount: cryptoAmount,
+          currency: 'USD',
+          paymentMethod: 'PayID19',
+          paymentUrl: cryptoInvoiceUrl,
+          userId: chatId,
+          username: recipientUsername,
+          chatId,
+          starCount: count,
+          isGift,
+          giftRecipient: giftUsername
+        });
+
+        await this.transactionLogger.logPaymentCreated({
+          transactionId: orderId + '_wata',
+          orderId,
+          amount: cardAmount,
+          currency: 'RUB',
+          paymentMethod: 'WATA',
+          paymentUrl: cardPaymentLink.url,
+          userId: chatId,
+          username: recipientUsername,
+          chatId,
+          starCount: count,
+          isGift,
+          giftRecipient: giftUsername
+        });
+
+        // Формируем сообщение с деталями заказа
+        const orderDetails = `📋 **Детали заказа:**\n` +
+          `• Заказ: \`${orderId}\`\n` +
+          `• Звёзд: **${count}**\n` +
+          `${isGift ? `• Получатель: **@${giftUsername}**\n` : ''}\n` +
+          `💳 **Выберите способ оплаты:**`;
+
+        // Создаем inline-кнопки
+        const inlineKeyboard = [
+          [{
+            text: `💰 Криптовалюта (${cryptoAmount} USD)`,
+            url: cryptoInvoiceUrl
+          }],
+          [{
+            text: `💳 Карта/СБП (${cardAmount} RUB)`,
+            url: cardPaymentLink.url || '#'
+          }]
+        ];
+
+        await this.tg.sendMessage(chatId, orderDetails, {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: inlineKeyboard,
+            remove_keyboard: true
+          }
+        });
+
+        // Добавляем информационное сообщение с постоянным меню
+        await this.tg.sendMessage(
+          chatId,
+          '⏰ **Срок оплаты: 30 минут**\n\n' +
+          '⏳ Нажмите на одну из кнопок выше для перехода к оплате\n' +
+          'После успешной оплаты звёзды будут автоматически начислены\n' +
+          'Вы получите уведомление о завершении операции',
+          { 
+            parse_mode: 'Markdown',
+            reply_markup: this.mainKeyboard.reply_markup
+          }
+        );
+
+        this.logger.log(`Payment options with details sent for order ${orderId}`);
+        
+        // Удаляем сессию, так как теперь всё управляется через webhook
+        this.session.delete(chatId);
+        
+      } catch (paymentError) {
+        this.logger.error('Failed to create payments:', paymentError);
+        
+        // Логируем ошибку создания платежей
+        await this.transactionLogger.logPaymentCreationFailed({
+          transactionId: orderId + '_failed',
+          orderId,
+          amount: cryptoAmount,
+          currency: 'USD',
+          paymentMethod: 'MULTIPLE',
+          errorDescription: 'Failed to create payment links',
+          processingError: paymentError instanceof Error ? paymentError.message : 'Unknown payment error',
+          userId: chatId,
+          username: recipientUsername,
+          chatId,
+          starCount: count,
+          isGift,
+          giftRecipient: giftUsername
+        });
+        
+        throw paymentError; // Переброс ошибки для обработки в общем catch
+      }
+      
+    } catch (error) {
+      this.logger.error('Failed to create payment options with details:', error);
+      await this.tg.sendMessage(
+        chatId,
+        '❗ Произошла ошибка при создании платежей. Попробуйте позже.',
+        { reply_markup: this.mainKeyboard.reply_markup }
+      );
+      this.session.delete(chatId);
+    }
   }
 
   /** Общая обработка оплаты (моки) */
@@ -184,40 +415,355 @@ export class BotService {
     isGift: boolean,
   ): Promise<void> {
     const count = session.count!;
+    // Генерируем супер уникальный orderId
+    const timestamp = Date.now();
+    const randomId = randomUUID().replace(/-/g, '').substring(0, 8); // 8 символов из UUID
+    const microseconds = process.hrtime.bigint() % 1000000n; // Микросекунды для доп. уникальности
+    const orderId = `${timestamp}_${chatId}_${randomId}_${microseconds}`;
+    const description = isGift 
+      ? `Подарок ${count} звезд для @${session.username}` 
+      : `Покупка ${count} звезд`;
+    
+    // Сохраняем информацию о заказе для webhook'а
+    this.saveOrderInfo(orderId, {
+      chatId,
+      userId: chatId,
+      count,
+      isGift,
+      giftUsername: session.username,
+      description,
+      timestamp: new Date().toISOString(),
+    });
+    
     switch (choice) {
-      case PaymentMethod.TON: {
-        const invoice = { walletAddress: 'EQC123ABC...', amount: 0.123 };
-        await this.tg.sendMessage(
-          chatId,
-          `Пополните внутренний кошелёк: ${invoice.walletAddress}\nСумма: ${invoice.amount} TON`,
-        );
-        break;
-      }
-      case PaymentMethod.USDT: {
-        const link = 'https://example.com/pay-usdt';
-        await this.tg.sendMessage(chatId, `Оплатить USDT: ${link}`);
+      case PaymentMethod.CRYPTO: {
+        try {
+          // Определяем username получателя для передачи в PayID19
+          let recipientUsername: string;
+          if (isGift && session.username) {
+            recipientUsername = session.username;
+          } else {
+            // Для покупки себе пытаемся получить username покупателя
+            const userInfo = await this.getUserInfo(chatId);
+            recipientUsername = userInfo?.username || `user_${chatId}`;
+          }
+          
+          // Создаем инвойс через PayID19 для криптоплатежей
+          const amount = count * STAR_PRICE_USD; // Стоимость звёзд в USD
+          const enhancedDescription = `${description} | recipient:${recipientUsername}`;
+          
+          const invoiceUrl = await this.payid19Service.createInvoice(
+            amount,
+            'USD',
+            enhancedDescription,
+            orderId,
+            undefined, // email не требуется
+          );
+          
+          // Получаем форматированный список поддерживаемых криптовалют
+          const supportedCryptos = this.payid19Service.getFormattedCryptocurrencies();
+          
+          // Форматируем сообщение без специальных символов Markdown
+          const message = `💰 Оплата криптовалютой\n\n` +
+            `🚀 Ссылка для оплаты:\n${invoiceUrl}\n\n` +
+            `📋 Детали заказа:\n` +
+            `• Заказ: ${orderId}\n` +
+            `• Сумма: ${amount} USD\n` +
+            `• Звёзд: ${count}\n\n` +
+            `🪙 Поддерживаемые криптовалюты:\n` +
+            `${supportedCryptos}\n\n` +
+            `⏰ Срок оплаты: 1 час\n` +
+            `🔒 Безопасный платеж через PayID19`;
+          
+          await this.tg.sendMessage(chatId, message, {
+            reply_markup: this.mainKeyboard.reply_markup
+          });
+          
+          this.logger.log(`PayID19 invoice created for order ${orderId}: ${invoiceUrl}`);
+        } catch (error) {
+          this.logger.error('PayID19 payment creation failed', error);
+          await this.tg.sendMessage(
+            chatId,
+            '❗ Произошла ошибка при создании криптоплатежа. Попробуйте позже.',
+            { reply_markup: this.mainKeyboard.reply_markup }
+          );
+          this.session.delete(chatId);
+          return;
+        }
         break;
       }
       case PaymentMethod.SBP: {
-        const link = 'https://example.com/pay-sbp';
-        await this.tg.sendMessage(chatId, `Оплатить картой/СБП: ${link}`);
+        try {
+          // Создаем платежную ссылку через WATA API
+          const amount = count *2; //STAR_PRICE_RUB; // Стоимость звёзд в рублях
+          const paymentLink = await this.wataService.createPaymentLink(
+            amount,
+            Currency.RUB,
+            description,
+            orderId
+          );
+          
+          if (paymentLink.url) {
+            const message = `💳 Оплата картой/СБП\n\n` +
+              `🚀 Ссылка для оплаты:\n${paymentLink.url}\n\n` +
+              `📋 Детали заказа:\n` +
+              `• Заказ: ${orderId}\n` +
+              `• Сумма: ${amount} ${paymentLink.currency}\n` +
+              `• Звёзд: ${count}\n\n` +
+              `⏰ Срок оплаты: до завершения сессии\n` +
+              `🔒 Безопасный платеж через WATA`;
+            
+            await this.tg.sendMessage(chatId, message, {
+              reply_markup: this.mainKeyboard.reply_markup
+            });
+            
+            this.logger.log(`Payment link created for order ${orderId}: ${paymentLink.url}`);
+          } else {
+            await this.tg.sendMessage(
+              chatId,
+              '❗ Не удалось создать ссылку на оплату. Попробуйте позже.',
+              { reply_markup: this.mainKeyboard.reply_markup }
+            );
+            this.session.delete(chatId);
+          }
+        } catch (error) {
+          this.logger.error('Payment creation failed', error);
+          await this.tg.sendMessage(
+            chatId,
+            '❗ Произошла ошибка при создании платежа. Попробуйте позже.',
+            { reply_markup: this.mainKeyboard.reply_markup }
+          );
+          this.session.delete(chatId);
+          return;
+        }
         break;
       }
       default:
-        await this.tg.sendMessage(chatId, '❗ Выберите способ оплаты из меню.');
+        await this.tg.sendMessage(chatId, '❗ Выберите способ оплаты из меню.', {
+          reply_markup: this.mainKeyboard.reply_markup
+        });
         this.session.delete(chatId);
         return;
     }
 
-    if (isGift) {
-      await this.tg.sendMessage(
-        chatId,
-        `🎉 Вы подарили ${count} звёзд пользователю @${session.username}!`,
-      );
+    // Добавляем информационное сообщение о том, что ожидаем оплату
+    await this.tg.sendMessage(
+      chatId, 
+      '⏳ Ожидаем оплату...\n\n' +
+      'После успешной оплаты звёзды будут автоматически начислены.\n' +
+      'Вы получите уведомление о завершении операции.',
+      { reply_markup: this.mainKeyboard.reply_markup }
+    );
+    
+    // Сессию не удаляем - она будет удалена в webhook после обработки
+  }
+
+  // Статическое хранилище заказов (в реальном проекте лучше использовать базу данных)
+  private static readonly orders = new Map<string, OrderInfo>();
+
+  /**
+   * Сохраняет информацию о заказе для последующего использования в webhook'ах
+   */
+  saveOrderInfo(orderId: string, orderInfo: OrderInfo): void {
+    BotService.orders.set(orderId, orderInfo);
+    this.logger.log(`Order info saved: ${orderId} for user ${orderInfo.chatId}`);
+  }
+
+  /**
+   * Получает информацию о заказе по его ID
+   */
+  static getOrderInfo(orderId: string): OrderInfo | undefined {
+    return BotService.orders.get(orderId);
+  }
+
+  /**
+   * Удаляет информацию о заказе после обработки
+   */
+  static removeOrderInfo(orderId: string): void {
+    BotService.orders.delete(orderId);
+  }
+
+  /**
+   * Получает информацию о пользователе Telegram
+   */
+  async getUserInfo(userId: number): Promise<{ username?: string; first_name?: string; last_name?: string } | null> {
+    try {
+      const chat = await this.tg.getChat(userId);
+      if (chat.type === 'private') {
+        return {
+          username: (chat as any).username,
+          first_name: (chat as any).first_name,
+          last_name: (chat as any).last_name,
+        };
+      }
+      return null;
+    } catch (error) {
+      this.logger.warn(`Failed to get user info for ${userId}:`, error);
+      return null;
     }
-    await this.tg.sendMessage(chatId, '✅ Операция завершена.', {
-      reply_markup: { remove_keyboard: true },
+  }
+
+  /**
+   * Отправляет уведомление пользователю о успешной покупке звёзд
+   */
+  async notifyStarsPurchaseSuccess(
+    chatId: number,
+    count: number,
+    isGift: boolean,
+    recipientUsername?: string,
+    fragmentOrderId?: string
+  ): Promise<void> {
+    try {
+      let message: string;
+      
+      if (isGift && recipientUsername) {
+        message = `🎉 **Подарок отправлен!**\n\n` +
+                 `⭐ **${count} звёзд** успешно подарено пользователю **@${recipientUsername}**\n\n` +
+                 `✅ Платёж обработан\n\n`;
+        if (fragmentOrderId) {
+          message += `📋 Fragment Order ID: \`${fragmentOrderId}\`\n\n`;
+        }
+        message += `✅ **Операция завершена!**\n` +
+                  `🌟 Спасибо за использование нашего сервиса!`;
+      } else {
+        message = `✅ **Покупка завершена!**\n\n` +
+                 `⭐ **${count} звёзд** успешно начислено на ваш аккаунт\n\n` +
+                 `💰 Платёж обработан\n\n`;
+        if (fragmentOrderId) {
+          message += `📋 Fragment Order ID: \`${fragmentOrderId}\`\n\n`;
+        }
+        message += `✅ **Операция завершена!**\n` +
+                  `🌟 Спасибо за покупку!`;
+      }
+
+      await this.tg.sendMessage(chatId, message, {
+        parse_mode: 'Markdown',
+        reply_markup: this.mainKeyboard.reply_markup
+      });
+      
+      this.logger.log(`Success notification sent to chat ${chatId}`);
+    } catch (error) {
+      this.logger.error(`Failed to send success notification to chat ${chatId}:`, error);
+    }
+  }
+
+  /**
+   * Отправляет уведомление пользователю об ошибке покупки звёзд
+   */
+  async notifyStarsPurchaseError(
+    chatId: number,
+    count: number,
+    isGift: boolean,
+    _errorMessage: string
+  ): Promise<void> {
+    try {
+      const message = `❌ **Ошибка при покупке звёзд**\n\n` +
+                     `Не удалось ${isGift ? 'отправить подарок' : 'начислить звёзды'}\n` +
+                     `Количество: ${count} звёзд\n\n` +
+                     `🔄 Мы уже работаем над решением проблемы\n` +
+                     `💬 Обратитесь в поддержку, если проблема повторится`;
+
+      await this.tg.sendMessage(chatId, message, {
+        parse_mode: 'Markdown',
+        reply_markup: this.mainKeyboard.reply_markup
+      });
+      
+      this.logger.log(`Error notification sent to chat ${chatId}`);
+    } catch (error) {
+      this.logger.error(`Failed to send error notification to chat ${chatId}:`, error);
+    }
+  }
+
+  /**
+   * Проверяет достаточность средств на Fragment балансе для покупки звёзд
+   * @param starsCount Количество звёзд
+   * @returns Результат проверки баланса
+   */
+  private async checkFragmentBalance(starsCount: number): Promise<{
+    sufficient: boolean;
+    availableTon: string;
+    requiredTon: number;
+  }> {
+    try {
+      this.logger.log(`Checking Fragment balance for ${starsCount} stars`);
+      
+      // Получаем баланс кошелька
+      const walletBalance = await this.fragmentService.getWalletBalance();
+      const availableTonNum = parseFloat(walletBalance.balance);
+      
+      // Рассчитываем необходимые средства
+      const requiredTon = this.fragmentService.calculateStarsCostInTon(starsCount);
+      
+      const sufficient = availableTonNum >= requiredTon;
+      
+      this.logger.log(`Balance check result: available=${availableTonNum} TON, required=${requiredTon} TON, sufficient=${sufficient}`);
+      
+      return {
+        sufficient,
+        availableTon: walletBalance.balance,
+        requiredTon,
+      };
+    } catch (error) {
+      this.logger.error('Failed to check Fragment balance:', error);
+      
+      // В случае ошибки считаем, что средств недостаточно
+      // и показываем просьбу обратиться в поддержку
+      const requiredTon = this.fragmentService.calculateStarsCostInTon(starsCount);
+      
+      return {
+        sufficient: false,
+        availableTon: 'недоступно',
+        requiredTon,
+      };
+    }
+  }
+
+  /**
+   * Обработка команды /help
+   */
+  async handleHelp(chatId: number): Promise<void> {
+    const helpMessage = `🆘 **Помощь**\n\n` +
+      `⭐ **О сервисе:**\n` +
+      `Наш сервис позволяет вам легко покупать звёзды Telegram для себя или в подарок друзьям.\n\n` +
+      `💳 **Способы оплаты:**\n` +
+      `• 💰 Криптовалюта (PayID19)\n` +
+      `• 💳 Карта/СБП (WATA)\n\n` +
+      `🎯 **Команды:**\n` +
+      `• /start - Главное меню\n` +
+      `• /buy_stars - Купить звёзды себе\n` +
+      `• /gift - Подарить звёзды другу\n` +
+      `⚡ **Минимальное количество:** ${MIN_STARS} звёзд\n\n` +
+      `🔒 **Безопасность:** все платежи обрабатываются через защищённые API`;
+
+    await this.tg.sendMessage(chatId, helpMessage, {
+      parse_mode: 'Markdown',
+      reply_markup: this.mainKeyboard.reply_markup
     });
-    this.session.delete(chatId);
+    
+    this.logger.log(`Help sent to chat ${chatId}`);
+  }
+
+  /**
+   * Обработка команды /support
+   */
+  async handleSupport(chatId: number): Promise<void> {
+    const supportMessage = `🆘 **Техническая поддержка**\n\n` +
+      `Если у вас возникли проблемы с оплатой или вопросы по работе сервиса:\n\n` +
+      `📧 **Обращения:**\n` +
+      `• Опишите свою проблему в чате\n` +
+      `• Приложите скриншоты, если возможно\n` +
+      `• Укажите ID заказа, если он есть\n\n` +
+      `⏰ **Время ответа:** обычно 15-30 минут\n\n` +
+      `📄 **Часто задаваемые вопросы:**\n` +
+      `• Платёж прошёл, а звёзды не пришли - подождите 5-10 минут\n` +
+      `• Ошибка при оплате - попробуйте другой способ оплаты\n\n` +
+      `ℹ️ Получить помощь: /help`;
+
+    await this.tg.sendMessage(chatId, supportMessage, {
+      parse_mode: 'Markdown',
+      reply_markup: this.mainKeyboard.reply_markup
+    });
+    
+    this.logger.log(`Support info sent to chat ${chatId}`);
   }
 }
