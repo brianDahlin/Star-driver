@@ -110,7 +110,7 @@ export class WataWebhookService {
       const fragmentOrder = await this.fragmentService.buyStars(
         recipientUsername,
         orderInfo.count,
-        true
+        false
       );
 
       console.log(`✨ Fragment заказ создан: ${fragmentOrder.id}`);

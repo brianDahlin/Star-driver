@@ -153,7 +153,7 @@ export class KassaWebhookService {
       const fragmentOrder = await this.fragmentService.buyStars(
         recipientUsername,
         orderInfo.count,
-        true
+        false
       );
 
       // ПОЛНОЕ логирование Fragment заказа
