@@ -1,7 +1,8 @@
-import { Injectable, Logger, BadGatewayException } from '@nestjs/common';
+import { Injectable, BadGatewayException } from '@nestjs/common';
 import { HttpService } from '@nestjs/axios';
 import { ConfigService } from '@nestjs/config';
 import { firstValueFrom } from 'rxjs';
+import { AppLogger } from '../utils/logger';
 
 // Интерфейс для запроса создания инвойса PayID19
 export interface PayID19CreateInvoiceRequest {
@@ -59,7 +60,7 @@ export interface PayID19WebhookData {
 
 @Injectable()
 export class PayID19Service {
-  private readonly logger = new Logger(PayID19Service.name);
+  private readonly logger = AppLogger;
   private readonly publicKey: string;
   private readonly privateKey: string;
   private readonly baseUrl: string;

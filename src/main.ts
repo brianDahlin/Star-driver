@@ -72,7 +72,7 @@ async function bootstrap(): Promise<void> {
     { command: 'start', description: '🏠 Главное меню' },
     { command: 'buy_stars', description: '⭐ Купить звёзды' },
     { command: 'gift', description: '🎁 Подарить звёзды другу' },
-  
+    { command: 'support', description: '💬 Поддержка' },
   ]);
   
   AppLogger.log('🔧 Menu button and commands configured');
@@ -111,18 +111,12 @@ async function bootstrap(): Promise<void> {
     return botService.handleCallback('', CallbackData.GIFT, ctx.chat.id);
   });
   
-  // Команда /help
-  bot.command('help', (ctx) => {
-    return botService.handleHelp(ctx.chat.id);
+  // Slash-команда /support
+  bot.command('support', (ctx) => {
+    return botService.handleCallback('', CallbackData.SUPPORT, ctx.chat.id);
   });
   
-  // Команда /support
-  bot.command('support', (ctx) => {
-    return botService.handleSupport(ctx.chat.id);
-  });
 
-  // Обработка всех остальных текстовых сообщений
-  // Обработка всех текстовых сообщений
   bot.on('text', (ctx) => {
     const text = ctx.message.text;
 
@@ -135,6 +129,11 @@ async function bootstrap(): Promise<void> {
     // если нажали «🎁 Купить Другу»
     if (text === '🎁 Сделать Подарок Другу') {
       return botService.handleCallback('', CallbackData.GIFT, ctx.chat.id);
+    }
+
+    // если нажали «Поддержка»
+    if (text === 'Поддержка') {
+      return botService.handleCallback('', CallbackData.SUPPORT, ctx.chat.id);
     }
 
     // всё остальное в общий текст-флоу

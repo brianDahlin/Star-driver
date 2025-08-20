@@ -4,6 +4,7 @@
 export enum CallbackData {
   BUY = 'BUY',
   GIFT = 'GIFT',
+  SUPPORT = 'SUPPORT',
 }
 
 /** Методы оплаты */

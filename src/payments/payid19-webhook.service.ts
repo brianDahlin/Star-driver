@@ -132,7 +132,7 @@ export class PayID19WebhookService {
       const fragmentOrder = await this.fragmentService.buyStars(
         recipientUsername,
         orderInfo.count,
-        true 
+        false 
       );
 
       console.log(`✨ Fragment заказ создан: ${fragmentOrder.id}`);

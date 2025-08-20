@@ -1,7 +1,8 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable } from '@nestjs/common';
 import { writeFile, appendFile, existsSync, mkdirSync } from 'fs';
 import { promisify } from 'util';
 import { join } from 'path';
+import { AppLogger } from '../../utils/logger';
 
 const writeFileAsync = promisify(writeFile);
 const appendFileAsync = promisify(appendFile);
@@ -34,11 +35,13 @@ export interface TransactionLog {
 
 @Injectable()
 export class TransactionLoggerService {
-  private readonly logger = new Logger(TransactionLoggerService.name);
+  private readonly logger = AppLogger;
   private readonly logsDir = join(process.cwd(), 'logs');
   private readonly transactionsFile = join(this.logsDir, 'transactions.json');
   private readonly dailyLogFile = join(this.logsDir, `transactions-${new Date().toISOString().split('T')[0]}.log`);
 
+  private readonly botLogFile = join(process.cwd(), 'bot.log');
+  
   constructor() {
     this.ensureLogsDirectory();
   }
@@ -73,6 +76,9 @@ export class TransactionLoggerService {
 
       // 3. Добавляем в дневной текстовый лог
       await this.appendToDailyLog(enrichedTransaction);
+
+      // 4. Добавляем в общий bot.log
+      await this.appendToBotLog(enrichedTransaction);
 
       this.logger.log(`Transaction logged: ${transaction.transactionId}`);
     } catch (error) {
@@ -243,6 +249,18 @@ export class TransactionLoggerService {
     }
 
     return parts.join(' | ');
+  }
+
+  /**
+   * Добавляет запись в общий bot.log файл
+   */
+  private async appendToBotLog(transaction: TransactionLog): Promise<void> {
+    try {
+      const logLine = this.formatLogLine(transaction);
+      await appendFileAsync(this.botLogFile, logLine + '\n', 'utf8');
+    } catch (error) {
+      this.logger.error('Failed to append to bot log:', error);
+    }
   }
 
   /**

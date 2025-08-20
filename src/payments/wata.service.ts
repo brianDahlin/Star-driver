@@ -1,7 +1,8 @@
-import { Injectable, Logger, BadGatewayException } from '@nestjs/common';
+import { Injectable, BadGatewayException } from '@nestjs/common';
 import { HttpService } from '@nestjs/axios';
 import { ConfigService } from '@nestjs/config';
 import { firstValueFrom } from 'rxjs';
+import { AppLogger } from '../utils/logger';
 
 export interface WataPaymentResponse {
   id: string;
@@ -53,7 +54,7 @@ export interface WataCreatePaymentLinkResponse {
 
 @Injectable()
 export class WataService {
-  private readonly logger = new Logger(WataService.name);
+  private readonly logger = AppLogger;
   private readonly accessToken: string;
   private readonly baseUrl: string;
 

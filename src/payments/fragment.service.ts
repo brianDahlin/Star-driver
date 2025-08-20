@@ -1,7 +1,8 @@
-import { Injectable, Logger, BadGatewayException } from '@nestjs/common';
+import { Injectable, BadGatewayException } from '@nestjs/common';
 import { HttpService } from '@nestjs/axios';
 import { ConfigService } from '@nestjs/config';
 import { firstValueFrom } from 'rxjs';
+import { AppLogger } from '../utils/logger';
 
 // Ответ аутентификации Fragment API
 export interface FragmentAuthResponse {
@@ -31,7 +32,7 @@ export interface WalletBalanceResponse {
 
 @Injectable()
 export class FragmentService {
-  private readonly logger = new Logger(FragmentService.name);
+  private readonly logger = AppLogger;
   private jwtToken: string | null = null;
   private readonly apiKey: string;
   private readonly phoneNumber: string;
@@ -103,7 +104,7 @@ export class FragmentService {
   async buyStars(
     username: string,
     quantity: number,
-    showSender = true,
+    showSender = false,
   ): Promise<StarsOrderResponse> {
     if (!this.jwtToken) {
       await this.authenticate();
@@ -198,6 +199,7 @@ export class FragmentService {
       );
       
       this.logger.log(`Wallet balance retrieved: ${response.data.balance} TON`);
+     
       return response.data;
     } catch (err: any) {
       this.logger.error('Fragment wallet balance request failed:', {

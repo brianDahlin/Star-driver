@@ -1,8 +1,8 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable } from '@nestjs/common';
 import { Telegram } from 'telegraf';
 import { ConfigService } from '@nestjs/config';
 import { randomUUID } from 'crypto';
-import { MIN_STARS, START_CAPTION, STAR_PRICE_USD, Currency } from '../common/constants/star.constants';
+import { MIN_STARS, START_CAPTION, STAR_PRICE_RUB, STAR_PRICE_USD, Currency } from '../common/constants/star.constants';
 import {
   CallbackData,
   PaymentMethod,
@@ -10,8 +10,10 @@ import {
 import { WataService } from '../payments/wata.service';
 import { PayID19Service } from '../payments/payid19.service';
 import { FragmentService } from '../payments/fragment.service';
+import { KassaService } from '../payments/kassa.service';
 import { TransactionLoggerService } from '../common/services/transaction-logger.service';
 import { Markup } from 'telegraf';
+import { AppLogger } from '../utils/logger';
 
 // Сессия пользователя для диалогов
 interface SessionData {
@@ -35,19 +37,21 @@ export interface OrderInfo {
 @Injectable()
 export class BotService {
   private readonly tg: Telegram;
-  private readonly logger = new Logger(BotService.name);
+  private readonly logger = AppLogger;
   private readonly session = new Map<number, SessionData>();
   
   // Постоянное Reply-меню
   private readonly mainKeyboard = Markup.keyboard([
     ['⭐ Купить Звёзды'],
     ['🎁 Сделать Подарок Другу'],
+    ['Поддержка'],
   ]).resize().oneTime(false);
 
   constructor(
     private readonly config: ConfigService,
     private readonly wataService: WataService,
     private readonly payid19Service: PayID19Service,
+    private readonly kassaService: KassaService,
     private readonly fragmentService: FragmentService,
     private readonly transactionLogger: TransactionLoggerService,
   ) {
@@ -76,10 +80,7 @@ export class BotService {
         },
       });
       
-      // Отправляем также постоянное Reply-меню
-      await this.tg.sendMessage(chatId, 'Выберите действие:', {
-        reply_markup: this.mainKeyboard.reply_markup
-      });
+     
       
       this.logger.log(`/start handled for chat ${chatId}`);
     } catch (err) {
@@ -108,6 +109,9 @@ export class BotService {
         session = { flow: 'gift', step: 1 };
         this.session.set(userId, session);
         await this.askUsername(userId);
+        return;
+      case CallbackData.SUPPORT:
+        await this.handleSupport(userId);
         return;
       default:
         await this.tg.sendMessage(
@@ -266,7 +270,7 @@ export class BotService {
 
       // Рассчитываем стоимости
       const cryptoAmount = count * STAR_PRICE_USD; // USD для крипто
-      const cardAmount = count * 2; // RUB для карт/СБП вата сервис не позволяет меньше ста рублей
+      const cardAmount = count * STAR_PRICE_RUB; // RUB для карт/СБП вата сервис не позволяет меньше ста рублей
 
       // Определяем username получателя для PayID19
       let recipientUsername: string;
@@ -281,7 +285,8 @@ export class BotService {
       const enhancedDescription = `${description} | recipient:${recipientUsername}`;
       
       try {
-        const [cryptoInvoiceUrl, cardPaymentLink] = await Promise.all([
+        // Используем тот же orderId для всех платежных систем        
+        const [cryptoInvoiceUrl, cardPaymentLink, kassaPayment] = await Promise.all([
           this.payid19Service.createInvoice(
             cryptoAmount,
             'USD',
@@ -294,6 +299,11 @@ export class BotService {
             Currency.RUB,
             description,
             orderId
+          ),
+          this.kassaService.createPayment(
+            cardAmount,
+            orderId,
+
           )
         ]);
 
@@ -328,22 +338,44 @@ export class BotService {
           giftRecipient: giftUsername
         });
 
+        await this.transactionLogger.logPaymentCreated({
+          transactionId: orderId + '_p2pkassa',
+          orderId: orderId,
+          amount: cardAmount,
+          currency: 'RUB',
+          paymentMethod: 'P2PKassa',
+          userId: chatId,
+          username: recipientUsername,
+          chatId,
+          starCount: count,
+          isGift,
+          giftRecipient: giftUsername
+        });
+
         // Формируем сообщение с деталями заказа
         const orderDetails = `📋 **Детали заказа:**\n` +
           `• Заказ: \`${orderId}\`\n` +
           `• Звёзд: **${count}**\n` +
           `${isGift ? `• Получатель: **@${giftUsername}**\n` : ''}\n` +
+          '⏰ **Срок оплаты: 30 минут**\n\n' +
+          '⏳ Нажмите на одну из кнопок выше для перехода к оплате\n' +
+          'После успешной оплаты звёзды будут автоматически начислены\n' +
+          'Вы получите уведомление о завершении операции\n\n' +
           `💳 **Выберите способ оплаты:**`;
 
         // Создаем inline-кнопки
         const inlineKeyboard = [
           [{
-            text: `💰 Криптовалюта (${cryptoAmount} USD)`,
+            text: `💰 Криптовалюта (${Number(cryptoAmount.toFixed(2))} USD)`,
             url: cryptoInvoiceUrl
           }],
           [{
-            text: `💳 Карта/СБП (${cardAmount} RUB)`,
+            text: `💳 Карта/СБП WATA (${cardAmount} RUB)`,
             url: cardPaymentLink.url || '#'
+          }],
+          [{
+            text: `💳 Карта/СБП Kassa (${cardAmount} RUB)`,
+            url: kassaPayment.link || '#'
           }]
         ];
 
@@ -353,20 +385,7 @@ export class BotService {
             inline_keyboard: inlineKeyboard,
             remove_keyboard: true
           }
-        });
-
-        // Добавляем информационное сообщение с постоянным меню
-        await this.tg.sendMessage(
-          chatId,
-          '⏰ **Срок оплаты: 30 минут**\n\n' +
-          '⏳ Нажмите на одну из кнопок выше для перехода к оплате\n' +
-          'После успешной оплаты звёзды будут автоматически начислены\n' +
-          'Вы получите уведомление о завершении операции',
-          { 
-            parse_mode: 'Markdown',
-            reply_markup: this.mainKeyboard.reply_markup
-          }
-        );
+        });   
 
         this.logger.log(`Payment options with details sent for order ${orderId}`);
         
@@ -468,7 +487,7 @@ export class BotService {
             `🚀 Ссылка для оплаты:\n${invoiceUrl}\n\n` +
             `📋 Детали заказа:\n` +
             `• Заказ: ${orderId}\n` +
-            `• Сумма: ${amount} USD\n` +
+            `• Сумма: ${Number(amount.toFixed(2))} USD\n` +
             `• Звёзд: ${count}\n\n` +
             `🪙 Поддерживаемые криптовалюты:\n` +
             `${supportedCryptos}\n\n` +
@@ -495,7 +514,7 @@ export class BotService {
       case PaymentMethod.SBP: {
         try {
           // Создаем платежную ссылку через WATA API
-          const amount = count *2; //STAR_PRICE_RUB; // Стоимость звёзд в рублях
+          const amount = count * STAR_PRICE_RUB; // Стоимость звёзд в рублях
           const paymentLink = await this.wataService.createPaymentLink(
             amount,
             Currency.RUB,
@@ -689,6 +708,7 @@ export class BotService {
       
       // Получаем баланс кошелька
       const walletBalance = await this.fragmentService.getWalletBalance();
+      
       const availableTonNum = parseFloat(walletBalance.balance);
       
       // Рассчитываем необходимые средства
@@ -718,52 +738,29 @@ export class BotService {
     }
   }
 
-  /**
-   * Обработка команды /help
-   */
-  async handleHelp(chatId: number): Promise<void> {
-    const helpMessage = `🆘 **Помощь**\n\n` +
-      `⭐ **О сервисе:**\n` +
-      `Наш сервис позволяет вам легко покупать звёзды Telegram для себя или в подарок друзьям.\n\n` +
-      `💳 **Способы оплаты:**\n` +
-      `• 💰 Криптовалюта (PayID19)\n` +
-      `• 💳 Карта/СБП (WATA)\n\n` +
-      `🎯 **Команды:**\n` +
-      `• /start - Главное меню\n` +
-      `• /buy_stars - Купить звёзды себе\n` +
-      `• /gift - Подарить звёзды другу\n` +
-      `⚡ **Минимальное количество:** ${MIN_STARS} звёзд\n\n` +
-      `🔒 **Безопасность:** все платежи обрабатываются через защищённые API`;
-
-    await this.tg.sendMessage(chatId, helpMessage, {
-      parse_mode: 'Markdown',
-      reply_markup: this.mainKeyboard.reply_markup
-    });
-    
-    this.logger.log(`Help sent to chat ${chatId}`);
-  }
-
-  /**
-   * Обработка команды /support
-   */
+  /** Обработка запроса поддержки */
   async handleSupport(chatId: number): Promise<void> {
-    const supportMessage = `🆘 **Техническая поддержка**\n\n` +
-      `Если у вас возникли проблемы с оплатой или вопросы по работе сервиса:\n\n` +
-      `📧 **Обращения:**\n` +
-      `• Опишите свою проблему в чате\n` +
-      `• Приложите скриншоты, если возможно\n` +
-      `• Укажите ID заказа, если он есть\n\n` +
-      `⏰ **Время ответа:** обычно 15-30 минут\n\n` +
-      `📄 **Часто задаваемые вопросы:**\n` +
-      `• Платёж прошёл, а звёзды не пришли - подождите 5-10 минут\n` +
-      `• Ошибка при оплате - попробуйте другой способ оплаты\n\n` +
-      `ℹ️ Получить помощь: /help`;
-
-    await this.tg.sendMessage(chatId, supportMessage, {
-      parse_mode: 'Markdown',
-      reply_markup: this.mainKeyboard.reply_markup
-    });
-    
-    this.logger.log(`Support info sent to chat ${chatId}`);
+    try {
+      await this.tg.sendMessage(
+        chatId,
+        '💬 **Поддержка**\n\n' +
+        'Обратитесь в нашу техническую поддержку для помощи:',
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [{
+                text: '💬 Поддержка @Purple13s',
+                url: 'https://t.me/Purple13s'
+              }]
+            ]
+          }
+        }
+      );
+      this.logger.log(`Support message sent to chat ${chatId}`);
+    } catch (error) {
+      this.logger.error(`Failed to send support message to chat ${chatId}:`, error);
+    }
   }
+
 }
